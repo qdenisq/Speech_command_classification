@@ -46,9 +46,9 @@ class BaseNN(object):
         num_classes = self._model_settings['label_count']
         self._batchY = tf.placeholder(tf.int64, [None], name=self.name + '_batchY')
 
-        control_dependencies = []
-        checks = tf.add_check_numerics_ops()
-        control_dependencies = [checks]
+        # control_dependencies = []
+        # checks = tf.add_check_numerics_ops()
+        # control_dependencies = [checks]
 
         with tf.name_scope('cross_entropy'):
             self._cross_entropy_mean = tf.losses.sparse_softmax_cross_entropy(
@@ -57,7 +57,7 @@ class BaseNN(object):
         with tf.name_scope('train'):
             self._learning_rate_input = tf.placeholder(
                 tf.float32, [], name='learning_rate_input')
-            self._train_step = tf.train.GradientDescentOptimizer(
+            self._train_step = tf.train.AdamOptimizer(
                 self._learning_rate_input).minimize(self._cross_entropy_mean)
         predicted_indices = tf.argmax(self._logits, 1)
         correct_prediction = tf.equal(predicted_indices, self._batchY)
@@ -86,9 +86,9 @@ class BaseNN(object):
 
         # Merge all the summaries and write them out to /tmp/retrain_logs (by default)
         merged_summaries = tf.summary.merge_all()
-        train_writer = tf.summary.FileWriter(self._model_settings['summaries_dir'] + '/train',
+        train_writer = tf.summary.FileWriter(self._model_settings['summaries_dir'] + '/{}_train'.format(self.name),
                                              sess.graph)
-        validation_writer = tf.summary.FileWriter(self._model_settings['summaries_dir'] + '/validation')
+        validation_writer = tf.summary.FileWriter(self._model_settings['summaries_dir'] + '/{}_validation'.format(self.name))
 
         tf.global_variables_initializer().run()
 
@@ -197,6 +197,13 @@ class BaseNN(object):
         tf.logging.info('Final test accuracy = %.1f%% (N=%d)' % (total_accuracy * 100,
                                                                  set_size))
 
+    def predict(self, x):
+        sess = tf.get_default_session()
+        assert(sess is not None)
+        logits = sess.run(self._logits, feed_dict={self._batchX: x})
+        predicted = np.argmax(logits)
+        return predicted
+
 
 class ConvRNN(BaseNN):
     def __init__(self, name, model_settings):
@@ -226,8 +233,6 @@ class ConvRNN(BaseNN):
                                                  self._model_settings['dct_coefficient_count']], name=self.name + '_batchX')
 
             # self._batchX = tf.placeholder(tf.float32, [None, self._model_settings['fingerprint_size']], name=self.name + '_batchX')
-
-
             num_classes = self._model_settings['label_count']
 
             num_hidden = self._model_settings['hidden_reccurent_cells_count']
@@ -259,6 +264,94 @@ class ConvRNN(BaseNN):
             weight = tf.Variable(tf.truncated_normal([num_hidden, num_classes]))
             bias = tf.Variable(tf.constant(0.1, shape=[num_classes]))
             self._logits = tf.matmul(last, weight) + bias
+
+
+class MultiConvRNN(BaseNN):
+    def __init__(self, name, model_settings):
+        BaseNN.__init__(self, name, model_settings)
+        self._model_settings = model_settings
+        self.name = name
+        self._logits = None
+        self._batchX = None
+        self._batchY = None
+        self._learning_rate_input = None
+        self._cross_entropy_mean = None
+        self._train_step = None
+        self._confusion_matrix = None
+        self._evaluation_step = None
+        self._increment_global_step = None
+        self._dropout_prob = None
+        self._states = None
+        self.build_forward_pass_graph()
+        self.build_train_graph()
+        return
+
+    def build_forward_pass_graph(self):
+        assert(tf.get_default_session() is not None)
+        seq_length = self._model_settings['strip_array_length']
+        with tf.name_scope('forward_prop'):
+            self._batchX = tf.placeholder(tf.float32, [None, seq_length,
+                                                 self._model_settings['strip_window_size_samples'],
+                                                 self._model_settings['dct_coefficient_count']], name=self.name + '_batchX')
+
+            # self._batchX = tf.placeholder(tf.float32, [None, self._model_settings['fingerprint_size']], name=self.name + '_batchX')
+            num_classes = self._model_settings['label_count']
+
+            num_hidden = self._model_settings['hidden_reccurent_cells_count']
+
+            input_5d = tf.reshape(self._batchX,
+                                        [-1, seq_length, self._model_settings['strip_window_size_samples'],
+                                         self._model_settings['dct_coefficient_count'], 1])
+            first_filter_time_depth = 1
+            first_filter_width = 8
+            first_filter_height = 10
+            first_filter_count = 64
+            first_weights = tf.Variable(
+                tf.truncated_normal(
+                    [first_filter_time_depth, first_filter_height, first_filter_width, 1, first_filter_count],
+                    stddev=0.01))
+            first_bias = tf.Variable(tf.zeros([first_filter_count]))
+            first_conv = tf.nn.conv3d(input_5d, first_weights, [1, 1, 1, 1, 1],
+                                      'SAME') + first_bias
+            first_relu = tf.nn.relu(first_conv)
+            self._dropout_prob = tf.placeholder(dtype=tf.float32, shape=[])
+            first_dropout = tf.nn.dropout(first_relu, self._dropout_prob)
+
+            first_max_pool = tf.nn.max_pool3d(first_dropout, [1, 1, 1, 3, 1], [1, 1, 1, 3, 1], 'SAME')
+
+            second_filter_time_depth = 1
+            second_filter_width = 4
+            second_filter_height = 5
+            second_filter_count = 64
+            second_weights = tf.Variable(
+                tf.truncated_normal(
+                    [second_filter_time_depth, second_filter_height, second_filter_width, first_filter_count, second_filter_count],
+                    stddev=0.01))
+            second_bias = tf.Variable(tf.zeros([second_filter_count]))
+            second_conv = tf.nn.conv3d(first_max_pool, second_weights, [1, 1, 1, 1, 1],
+                                      'SAME') + second_bias
+            second_relu = tf.nn.relu(second_conv)
+            second_dropout = tf.nn.dropout(second_relu, self._dropout_prob)
+
+            # second_max_pool = tf.nn.max_pool3d(second_dropout, [1, 1, 2, 2, 1], [1, 1, 2, 2, 1], 'SAME')
+            second_max_pool = second_dropout
+
+            max_pool_reshaped = tf.reshape(second_max_pool, [-1,
+                                                             second_max_pool.shape[1],
+                                                             second_max_pool.shape[-3] * second_max_pool.shape[-2] * second_max_pool.shape[-1]])
+            rnn_cell = tf.nn.rnn_cell.LSTMCell(num_units=num_hidden, state_is_tuple=True)
+            val, self._states = tf.nn.dynamic_rnn(rnn_cell, max_pool_reshaped, dtype=tf.float32)
+            val = tf.transpose(val, [1, 0, 2])
+            last = tf.gather(val, int(val.get_shape()[0]) - 1)
+            weight = tf.Variable(tf.truncated_normal([num_hidden, num_classes]))
+            bias = tf.Variable(tf.constant(0.1, shape=[num_classes]))
+            self._logits = tf.matmul(last, weight) + bias
+
+    def get_hidden_state(self, x):
+        sess = tf.get_default_session()
+        assert (sess is not None)
+        states = sess.run(self._states, feed_dict={self._batchX: x})
+        return states
 
 
 class Conv2dNN(BaseNN):
