@@ -44,30 +44,31 @@ class BaseNN(object):
         assert(tf.get_default_session() is not None)
         # Create the back propagation and training evaluation machinery in the graph.
         num_classes = self._model_settings['label_count']
-        self._batchY = tf.placeholder(tf.int64, [None], name=self.name + '_batchY')
+        self._batchY = tf.placeholder(tf.int64, [None], name='batchY')
 
         # control_dependencies = []
         # checks = tf.add_check_numerics_ops()
         # control_dependencies = [checks]
 
         with tf.name_scope('cross_entropy'):
-            self._cross_entropy_mean = tf.losses.sparse_softmax_cross_entropy(
+            cross_entropy_mean = tf.losses.sparse_softmax_cross_entropy(
                 labels=self._batchY, logits=self._logits)
+            self._cross_entropy_mean = tf.identity(cross_entropy_mean, name='cross_entropy_mean')
         tf.summary.scalar('cross_entropy', self._cross_entropy_mean)
         with tf.name_scope('train'):
             self._learning_rate_input = tf.placeholder(
                 tf.float32, [], name='learning_rate_input')
             self._train_step = tf.train.AdamOptimizer(
-                self._learning_rate_input).minimize(self._cross_entropy_mean)
+                self._learning_rate_input).minimize(self._cross_entropy_mean, name='train_step')
         predicted_indices = tf.argmax(self._logits, 1)
         correct_prediction = tf.equal(predicted_indices, self._batchY)
         self._confusion_matrix = tf.confusion_matrix(
-            self._batchY, predicted_indices, num_classes=num_classes)
-        self._evaluation_step = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
+            self._batchY, predicted_indices, num_classes=num_classes, name='confusion_matrix')
+        self._evaluation_step = tf.reduce_mean(tf.cast(correct_prediction, tf.float32), name='evaluation_step')
         tf.summary.scalar('accuracy', self._evaluation_step)
 
         global_step = tf.train.get_or_create_global_step()
-        self._increment_global_step = tf.assign(global_step, global_step + 1)
+        self._increment_global_step = tf.assign(global_step, global_step + 1, name='increment_global_step')
 
     def train(self, audio_processor):
         sess = tf.get_default_session()
@@ -200,7 +201,8 @@ class BaseNN(object):
     def predict(self, x):
         sess = tf.get_default_session()
         assert(sess is not None)
-        logits = sess.run(self._logits, feed_dict={self._batchX: x})
+        logits = sess.run(self._logits, feed_dict={self._batchX: x,
+                                                   self._dropout_prob: 1.0})
         predicted = np.argmax(logits)
         return predicted
 
@@ -230,7 +232,7 @@ class ConvRNN(BaseNN):
         with tf.name_scope('forward_prop'):
             self._batchX = tf.placeholder(tf.float32, [None, seq_length,
                                                  self._model_settings['strip_window_size_samples'],
-                                                 self._model_settings['dct_coefficient_count']], name=self.name + '_batchX')
+                                                 self._model_settings['dct_coefficient_count']], name='batchX')
 
             # self._batchX = tf.placeholder(tf.float32, [None, self._model_settings['fingerprint_size']], name=self.name + '_batchX')
             num_classes = self._model_settings['label_count']
@@ -252,7 +254,7 @@ class ConvRNN(BaseNN):
             first_conv = tf.nn.conv3d(input_5d, first_weights, [1, 1, 1, 1, 1],
                                       'SAME') + first_bias
             first_relu = tf.nn.relu(first_conv)
-            self._dropout_prob = tf.placeholder(dtype=tf.float32, shape=[])
+            self._dropout_prob = tf.placeholder(dtype=tf.float32, shape=[], name='dropout')
             first_dropout = tf.nn.dropout(first_relu, self._dropout_prob)
 
             max_pool = tf.nn.max_pool3d(first_dropout, [1, 1, 2, 2, 1], [1, 1, 2, 2, 1], 'SAME')
@@ -263,28 +265,57 @@ class ConvRNN(BaseNN):
             last = tf.gather(val, int(val.get_shape()[0]) - 1)
             weight = tf.Variable(tf.truncated_normal([num_hidden, num_classes]))
             bias = tf.Variable(tf.constant(0.1, shape=[num_classes]))
-            self._logits = tf.matmul(last, weight) + bias
+            self._logits = tf.add(tf.matmul(last, weight), bias, name='logits')
 
 
 class MultiConvRNN(BaseNN):
-    def __init__(self, name, model_settings):
+    def __init__(self, name, model_settings, restored_model=None):
         BaseNN.__init__(self, name, model_settings)
         self._model_settings = model_settings
         self.name = name
-        self._logits = None
-        self._batchX = None
-        self._batchY = None
-        self._learning_rate_input = None
-        self._cross_entropy_mean = None
-        self._train_step = None
-        self._confusion_matrix = None
-        self._evaluation_step = None
-        self._increment_global_step = None
-        self._dropout_prob = None
-        self._states = None
-        self.build_forward_pass_graph()
-        self.build_train_graph()
+        if restored_model is None:
+            self._logits = None
+            self._batchX = None
+            self._batchY = None
+            self._learning_rate_input = None
+            self._cross_entropy_mean = None
+            self._train_step = None
+            self._confusion_matrix = None
+            self._evaluation_step = None
+            self._increment_global_step = None
+            self._dropout_prob = None
+            self._state = None
+            self._rnn_outputs = None
+            self.build_forward_pass_graph()
+            self.build_train_graph()
+        else:
+            self._logits = restored_model['forward_prop/logits']
+            self._batchX = restored_model['forward_prop/batchX']
+            self._batchY = restored_model['batchY']
+            self._learning_rate_input = restored_model['train/learning_rate_input']
+            self._cross_entropy_mean = restored_model['cross_entropy/cross_entropy_mean']
+            self._train_step = restored_model['train/train_step']
+            self._confusion_matrix = restored_model['confusion_matrix/SparseTensorDenseAdd']
+            self._evaluation_step = restored_model['evaluation_step']
+            self._increment_global_step = restored_model['increment_global_step']
+            self._dropout_prob = restored_model['forward_prop/dropout']
+            self._state = restored_model['forward_prop/state']
+            self._rnn_outputs = restored_model['forward_prop/rnn_outputs']
+        #     no need to build graph as its already restored
         return
+
+    @classmethod
+    def restore(cls, model_name, meta_path, ckpnt_path):
+        sess = tf.get_default_session()
+        assert(sess is not None)
+        saver = tf.train.import_meta_graph(meta_path)
+        saver.restore(sess, ckpnt_path)
+        graph = tf.get_default_graph()
+
+        list_tensors = [(i.name, i.values()) for i in graph.get_operations()]
+        tensors = dict(list_tensors)
+        restored_model = tensors
+        return cls(model_name, None, restored_model)
 
     def build_forward_pass_graph(self):
         assert(tf.get_default_session() is not None)
@@ -292,7 +323,7 @@ class MultiConvRNN(BaseNN):
         with tf.name_scope('forward_prop'):
             self._batchX = tf.placeholder(tf.float32, [None, seq_length,
                                                  self._model_settings['strip_window_size_samples'],
-                                                 self._model_settings['dct_coefficient_count']], name=self.name + '_batchX')
+                                                 self._model_settings['dct_coefficient_count']], name='batchX')
 
             # self._batchX = tf.placeholder(tf.float32, [None, self._model_settings['fingerprint_size']], name=self.name + '_batchX')
             num_classes = self._model_settings['label_count']
@@ -314,7 +345,7 @@ class MultiConvRNN(BaseNN):
             first_conv = tf.nn.conv3d(input_5d, first_weights, [1, 1, 1, 1, 1],
                                       'SAME') + first_bias
             first_relu = tf.nn.relu(first_conv)
-            self._dropout_prob = tf.placeholder(dtype=tf.float32, shape=[])
+            self._dropout_prob = tf.placeholder(dtype=tf.float32, shape=[], name='dropout')
             first_dropout = tf.nn.dropout(first_relu, self._dropout_prob)
 
             first_max_pool = tf.nn.max_pool3d(first_dropout, [1, 1, 1, 3, 1], [1, 1, 1, 3, 1], 'SAME')
@@ -339,19 +370,22 @@ class MultiConvRNN(BaseNN):
             max_pool_reshaped = tf.reshape(second_max_pool, [-1,
                                                              second_max_pool.shape[1],
                                                              second_max_pool.shape[-3] * second_max_pool.shape[-2] * second_max_pool.shape[-1]])
-            rnn_cell = tf.nn.rnn_cell.LSTMCell(num_units=num_hidden, state_is_tuple=True)
-            val, self._states = tf.nn.dynamic_rnn(rnn_cell, max_pool_reshaped, dtype=tf.float32)
+            rnn_cell = tf.nn.rnn_cell.LSTMCell(num_units=num_hidden, state_is_tuple=True, name='rnn_cell')
+            val, state = tf.nn.dynamic_rnn(rnn_cell, max_pool_reshaped, dtype=tf.float32)
+            self._state = tf.identity(state, name='state')
+            self._rnn_outputs = tf.identity(val, name='rnn_outputs')
             val = tf.transpose(val, [1, 0, 2])
             last = tf.gather(val, int(val.get_shape()[0]) - 1)
             weight = tf.Variable(tf.truncated_normal([num_hidden, num_classes]))
             bias = tf.Variable(tf.constant(0.1, shape=[num_classes]))
-            self._logits = tf.matmul(last, weight) + bias
+            self._logits = tf.add(tf.matmul(last, weight), bias, name='logits')
 
     def get_hidden_state(self, x):
         sess = tf.get_default_session()
         assert (sess is not None)
-        states = sess.run(self._states, feed_dict={self._batchX: x})
-        return states
+        outputs, state = sess.run([self._rnn_outputs, self._state], feed_dict={self._batchX: x,
+                                                   self._dropout_prob: 1.0})
+        return outputs, state
 
 
 class Conv2dNN(BaseNN):
